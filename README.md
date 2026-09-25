@@ -10,6 +10,8 @@
 
 另提供**漏采读数推断**接口：输入同一水表的起止读数与时间、两者之间的一个漏采时刻、模数、每秒速率上限与该账期账单总用量。先校验账单总量与首尾读数差的模数同余（同余且账单非负时，隐含总回绕次数自动非负），再按漏采时刻两侧各自的 `floor(速率 × 秒数)` 整数容量求**左侧可行用量闭区间**；将首读数加左侧用量后取模，在 `[0, 模数−1]` 内返回精确、不重叠的候选读数闭区间（跨零点拆段、覆盖全模数时返回全域）、候选个数与是否唯一。账单不相容或两侧容量不足时返回可区分的冲突原因，**不猜测读数**。
 
+另提供**最小统一速率上限**接口：输入同一水表的模数、严格递增的秒精度读数序列与账单总用量（**不预设速率上限**——速率正是待求量）。先按首尾读数差与模数校验账单同余，不相容时返回明确冲突；相容时在各段非负整数用量且总和等于账单的约束下，求使所有段「用量 ÷ 历时」均不超过它的**最小统一速率上限**，以约分后的分子/分母精确返回（不用浮点近似、不枚举全部圈数组合），并给出该门槛下每段可行圈数范围与是否唯一——范围不唯一时**不虚构单段用量**。
+
 ## 快速启动（Docker，一键）
 
 ```bash
@@ -24,6 +26,7 @@ docker compose up --build
 - 每日用量上下界：`POST http://localhost:8000/v1/usage/daily-range`
 - 换表账单复核：`POST http://localhost:8000/v1/usage/meter-change/reconcile`
 - 漏采读数推断：`POST http://localhost:8000/v1/usage/missing-reading`
+- 最小统一速率上限：`POST http://localhost:8000/v1/usage/minimum-rate`
 - 交互式文档（Swagger UI）：`http://localhost:8000/docs`
 - 健康检查：`http://localhost:8000/health`
 
@@ -34,7 +37,7 @@ docker compose up --build
 | 宿主机端口 | `8000` | 在 `docker-compose.yml` 的 `ports` 中修改，如 `"8080:8000"` |
 | 容器内端口 | `8000` | 由 `Dockerfile` 的 `CMD` 指定，一般无需修改 |
 
-无其他必需配置（无数据库、无外部依赖）。
+以上所有接口（含 `/v1/usage/minimum-rate`）均由同一容器内端口对外提供，无其他必需配置（无数据库、无外部依赖）。
 
 ## 本地运行（可选）
 
@@ -597,6 +600,145 @@ pytest
 - 冲突时 `candidate_intervals` 为空、`candidate_count` 为 0、`left_usage_min` / `left_usage_max` 为 `null`，**不猜测读数**。
 - 请求校验错误（漏采时刻不介于起止之间、缺时区、含亚秒、读数越界、负速率、账单为负或非整数等）返回 `422`。
 
+### `POST /v1/usage/minimum-rate`
+
+最小统一速率上限。输入同一水表的模数、严格递增的秒精度读数序列与账单总用量，**不预设每秒速率上限**——速率正是待求量。读数、时间戳、模数的校验规则与 `/v1/usage/verify` 完全一致（复用同一 `Reading` 校验）。先按首尾读数差与模数校验账单同余；相容时在各段非负整数用量且总和等于账单的约束下，求使所有段「用量 ÷ 历时」均不超过它的最小统一速率上限，以约分后的分子/分母精确返回（不用浮点近似、不枚举全部圈数组合）。
+
+**请求体**
+
+```json
+{
+  "modulus": 1000,
+  "total_usage": 2050,
+  "readings": [
+    { "timestamp": "2026-09-24T00:00:00Z", "value": 100 },
+    { "timestamp": "2026-09-24T00:00:10Z", "value": 200 },
+    { "timestamp": "2026-09-24T00:00:30Z", "value": 150 }
+  ]
+}
+```
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `modulus` | 整数 | `>= 1`，计数器模数（回绕周期） |
+| `total_usage` | 整数 | `>= 0`，账单总用量（非负整数） |
+| `readings` | 数组 | 至少 2 条；校验与 `/v1/usage/verify` 相同（秒精度带时区、严格递增、`0 <= value < modulus`） |
+
+**响应（可行且各段唯一，`200`，`status = "ok"`）**
+
+```json
+{
+  "status": "ok",
+  "modulus": 1000,
+  "total_usage": 2050,
+  "total_wraps": 2,
+  "min_rate": { "numerator": 195, "denominator": 2 },
+  "unique": true,
+  "segments": [
+    {
+      "index": 0,
+      "start_timestamp": "2026-09-24T00:00:00Z",
+      "end_timestamp": "2026-09-24T00:00:10Z",
+      "start_reading": 100,
+      "end_reading": 200,
+      "elapsed_seconds": 10,
+      "min_wraps": 0,
+      "max_wraps": 0,
+      "wraps": 0,
+      "usage": 100,
+      "min_usage": null,
+      "max_usage": null
+    },
+    {
+      "index": 1,
+      "start_timestamp": "2026-09-24T00:00:10Z",
+      "end_timestamp": "2026-09-24T00:00:30Z",
+      "start_reading": 200,
+      "end_reading": 150,
+      "elapsed_seconds": 20,
+      "min_wraps": 2,
+      "max_wraps": 2,
+      "wraps": 2,
+      "usage": 1950,
+      "min_usage": null,
+      "max_usage": null
+    }
+  ],
+  "conflicts": []
+}
+```
+
+上例中首尾读数差为 `50`，账单 `2050` 隐含总回绕次数 `K = 2`；段 1 用量 `100`（10s，速率 `10`），段 2 用量 `1950`（20s，速率 `97.5`）。任何更小的统一速率都无法让两段非负整数用量之和等于 `2050`，故最小统一速率上限为 `195/2 = 97.5`，以约分分子/分母 `195`、`2` 返回。
+
+- `min_rate`：使账单可行的最小统一每秒速率上限，`numerator` / `denominator` 为**约分后**的分子、分母（精确分数，非浮点近似）；冲突时为 `null`。
+- `segments`：该门槛与账单总量约束后的各段结果，字段含义与 `/v1/usage/reconcile` 一致——`min_wraps` / `max_wraps` 为仍可行的圈数范围；圈数唯一（`min_wraps == max_wraps`）的段给出确定 `wraps` / `usage`，`min_usage` / `max_usage` 为 `null`；仍有多解的段反之，**只给范围不虚构单段用量**。
+- `unique`：各段圈数是否**全部**被唯一确定。
+- `total_wraps`：账单总量隐含的总回绕次数 `K = (total_usage − (末读数 − 首读数)) / modulus`。
+
+**响应（可行但某段仍有多解，`unique = false`）**：三条读数均为 `500`（0s/10s/20s）、账单 `1000` 时，额外一圈可落在任一段，两段均只给范围：
+
+```json
+{
+  "status": "ok",
+  "total_wraps": 1,
+  "min_rate": { "numerator": 100, "denominator": 1 },
+  "unique": false,
+  "segments": [
+    { "index": 0, "elapsed_seconds": 10, "min_wraps": 0, "max_wraps": 1, "wraps": null, "usage": null, "min_usage": 0, "max_usage": 1000 },
+    { "index": 1, "elapsed_seconds": 10, "min_wraps": 0, "max_wraps": 1, "wraps": null, "usage": null, "min_usage": 0, "max_usage": 1000 }
+  ],
+  "conflicts": []
+}
+```
+
+**响应（冲突，`200`，`status = "conflict"`）**
+
+账单总量与首尾读数差模 `modulus` 不同余（`total_incompatible_modulus`）：
+
+```json
+{
+  "status": "conflict",
+  "total_wraps": null,
+  "min_rate": null,
+  "unique": false,
+  "segments": [],
+  "conflicts": [
+    {
+      "kind": "total",
+      "reason": "total_incompatible_modulus",
+      "detail": "账单总量与模数不相容：总量 B 必须满足 B ≡ 0 (mod 1000)（首尾读数差为 0），收到 500（余数 500），总回绕次数不是整数",
+      "feasible_min_total": 1000,
+      "feasible_max_total": null,
+      "expected_remainder": 0,
+      "total_wraps": null
+    }
+  ]
+}
+```
+
+账单同余但低于各段最小非负用量之和（`total_out_of_range`；读数 `100 → 900 → 100`、账单 `0`）：
+
+```json
+{
+  "status": "conflict",
+  "conflicts": [
+    {
+      "kind": "total",
+      "reason": "total_out_of_range",
+      "detail": "账单总量低于可行下界：各段用量为非负整数时，总用量至少为 1000（各段最小非负用量之和，模数 1000），收到 0，隐含总回绕次数 K=0 小于各段最小圈数之和；可行账单总量无上限（速率可任意放大）",
+      "feasible_min_total": 1000,
+      "feasible_max_total": null,
+      "expected_remainder": null,
+      "total_wraps": 0
+    }
+  ]
+}
+```
+
+- 两种冲突原因可区分：`total_incompatible_modulus` 为账单与模数不相容（`expected_remainder` 给出应有的余数，`total_wraps` 为 `null`）；`total_out_of_range` 为账单低于各段最小非负用量之和（此时同余成立、`total_wraps` 已知）。
+- `feasible_min_total`：可行账单总量下界（含），即各段最小非负用量之和 `Σ (d_i mod M)`；`feasible_max_total` 恒为 `null`——不预设速率上限时，速率总可继续放大，可行账单总量无上限。
+- 冲突时 `min_rate` 为 `null`、`segments` 为空。请求校验错误（读数越界、时间不递增、缺时区、含亚秒、账单为负或非整数等）返回 `422`。
+
 ## 判定规则
 
 对每段相邻读数 `(r1, t1) -> (r2, t2)`，真实增量为 `delta = (r2 - r1) + k * modulus`，其中 `k >= 0` 为整圈回绕次数。约束：
@@ -722,12 +864,37 @@ x ∈ [max(0, B − C_R), min(C_L, B)]
 
 容量均为整数，区间内每个整数 `x` 都可由某个左右侧非负整数分配达到。候选漏采读数为 `(r_start + x) mod modulus`：`x` 连续取值时候选在模数环上形成连续弧，候选数为 `min(x_max − x_min + 1, modulus)`；弧不跨零点时为单个闭区间，跨零点时拆为 `[a, modulus−1]` 与 `[0, b]` 两段（精确、互不重叠），候选数不少于模数时覆盖全部剩余类、返回全域 `[0, modulus−1]`。候选数为 1 时 `unique = true`。全程仅整数运算（速率上限由 `Fraction` 精确取整），不枚举候选。
 
+### 最小统一速率上限
+
+设段 `i` 读数差 `d_i`、历时 `t_i` 秒，真实用量 `u_i = d_i + k_i × modulus`（`k_i >= 0` 整数），账单要求 `Σ u_i = B`。先校验：
+
+1. **同余**：`B = Σ d_i + modulus × K`，`K` 必须为整数，否则 `total_incompatible_modulus`；
+2. **非负**：`k_i >= k_min_i`（使 `u_i >= 0` 的最小圈数，取值 0 或 1），要求 `K >= Σ k_min_i`，否则账单低于各段最小非负用量之和 `Σ a_i`（`total_out_of_range`；可行账单总量为 `{Σ a_i + j×modulus : j >= 0}`，无上限）。
+
+令 `a_i = d_i + k_min_i × modulus ∈ [0, M)`（段 `i` 的最小非负用量），`E = K − Σ k_min_i` 为待分配的额外圈数。段 `i` 分到 `x_i` 圈后速率为 `(a_i + x_i×M) / t_i`，问题即：`x_i >= 0`、`Σ x_i = E` 下最小化 `max_i (a_i + x_i×M)/t_i`。统一速率上限 `R` 可行当且仅当
+
+```
+R >= max_i a_i/t_i   且   Σ_i floor((R×t_i − a_i)/M) >= E
+```
+
+故最小可行速率为两个下界的较大者：
+
+```
+R* = max( max_i a_i/t_i,  V_E )
+```
+
+其中 `V_E` 为全体「抬升门槛」`v_i(m) = (a_i + m×M)/t_i`（`m >= 1`，第 `m` 圈把段 `i` 速率抬到该值）中**第 `E` 小者**：分配 `E` 圈必然使用 `E` 个门槛，取最小的 `E` 个即最优（段内门槛递增，自动满足先后顺序）。
+
+`V_E` 由**精确二分**求得：`f(R) = Σ floor((R×t_i − a_i)/M)` 统计不超过 `R` 的门槛数，取使 `f(R) >= E` 的最小 `R`。候选值两两之差不小于 `1/max(t_i)²`（同段间距 `M/t_i`，跨段差为整数非零分子除以 `t_i×t_j`），区间收窄到该宽度以下后 `(lo, hi]` 内恰剩一个候选，按整除条件直接取出。全程整数/`Fraction` 精确运算，计算量与圈数大小无关，**不枚举圈数组合、不用浮点近似**。
+
+定出 `R*` 后，各段可行圈数 `k_i ∈ [k_min_i, k_min_i + floor((R*×t_i − a_i)/M)]`，再以账单总量做整数区间收紧（同账单总量对账规则）；`lo_i' == hi_i'` 的段圈数唯一、确定用量，其余段仅返回范围，不做猜测。
+
 ## 项目结构
 
 ```
 app/
   main.py   # FastAPI 应用、请求/响应模型与校验
-  core.py   # 回绕次数判定、总量对账、换表丢番图联立、跨日子段界与漏采读数候选区间（Fraction 精确计算）
+  core.py   # 回绕次数判定、总量对账、换表丢番图联立、跨日子段界、漏采读数候选区间与最小统一速率上限（Fraction 精确计算）
 tests/
   test_api.py
 Dockerfile

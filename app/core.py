@@ -52,6 +52,21 @@
     同余且 B >= 0 时 K 自动非负。左侧用量 x 的可行闭区间为
     [max(0, B - C_R), min(C_L, B)]，候选读数 (首读数 + x) mod M 在模 M
     环上形成连续弧：跨零点拆段、覆盖全模数时返回全域。
+
+最小统一速率上限（solve_minimum_rate）：
+    不预设速率上限，在账单总量 B = Σ(d_i + k_i*M)（k_i >= 0 整数）约束下，
+    求使各段速率 (d_i + k_i*M)/t_i 均不超过它的最小统一速率 R*。
+    令 a_i = d_i + k_min_i*M ∈ [0, M) 为各段最小非负用量、
+    E = K - Σk_min_i 为待分配的额外圈数，则
+
+        R* = max( max_i a_i/t_i,  V_E )
+
+    其中 V_E 为全体"抬升门槛" (a_i + m*M)/t_i（m >= 1）中第 E 小者：
+    分配 E 圈必然使用 E 个门槛，取最小的 E 个即最优。V_E 由精确二分
+    求得（候选值两两之差 >= 1/max(t_i)^2，收窄后按整除条件取出唯一
+    候选），全程整数/分数运算，不枚举圈数组合。定出 R* 后各段可行圈数
+    区间 [k_min_i, k_min_i + floor((R*·t_i - a_i)/M)] 再交由
+    reconcile_total 以账单总量收紧。
 """
 
 from __future__ import annotations
@@ -678,4 +693,171 @@ def solve_missing_reading(
         left_usage_max=x_hi,
         intervals=intervals,
         candidate_count=count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 最小统一速率上限（minimum-rate）：账单总量约束下求最小可行统一速率
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MinimumRateResult:
+    """最小统一速率上限求解结果。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    conflicts: Tuple[str, ...]  # REASON_TOTAL_* 原因
+    total_wraps: Optional[int]  # 账单隐含的总回绕次数 K；不相容时为 None
+    min_rate: Optional[Fraction]  # 最小统一每秒速率上限（约分分数）；冲突时为 None
+    narrowed: Tuple[NarrowedSegment, ...]  # 该门槛与账单总量约束后的各段圈数区间
+    feasible_min_total: int  # 可行账单总量下界（含）：各段最小非负用量之和
+
+
+def solve_minimum_rate(
+    diffs: Sequence[int],
+    elapsed_seconds: Sequence[int],
+    total_usage: int,
+    modulus: int,
+) -> MinimumRateResult:
+    """求使账单总量可行的最小统一每秒速率上限（精确分数，不枚举圈数组合）。
+
+    各段真实用量 ``u_i = d_i + k_i*M``（``k_i >= 0`` 整数，``d_i`` 为段内
+    读数差），须满足 ``Σ u_i = B``（账单总量）；段 ``i`` 的速率为
+    ``u_i / t_i``（``t_i`` 为段历时秒数）。本函数求最小统一速率上限
+    ``R*``，使存在非负整数圈数分配 ``(k_i)`` 满足总量约束且所有
+    ``u_i / t_i <= R*``：
+
+    1. 同余校验：``B = Σ d_i + M*K`` 要求 ``K = (B - Σd_i)/M`` 为整数，
+       否则账单与模数不相容（``total_incompatible_modulus``）；
+    2. 非负性：``k_i >= k_min_i``（使 ``u_i >= 0`` 的最小圈数，取值 0 或
+       1），要求 ``K >= Σ k_min_i``，否则账单低于各段最小非负用量之和
+       （``total_out_of_range``；可行账单总量无上限，速率总可继续放大）；
+    3. 令 ``a_i = d_i + k_min_i*M ∈ [0, M)``（段 ``i`` 的最小非负用量），
+       ``E = K - Σ k_min_i`` 为待分配的额外圈数。段 ``i`` 分到 ``x_i``
+       圈后速率为 ``(a_i + x_i*M)/t_i``，问题即：``x_i >= 0``、
+       ``Σ x_i = E`` 下最小化 ``max_i (a_i + x_i*M)/t_i``；
+    4. 下界一：任何分配的 max 速率 >= 各段基础速率 ``a_i/t_i`` 的最大值
+       ``R0``。下界二：第 ``m`` 圈把段 ``i`` 速率抬到门槛
+       ``v_i(m) = (a_i + m*M)/t_i``，分配 ``E`` 圈必然使用 ``E`` 个门槛，
+       故 max 速率 >= 全体门槛中第 ``E`` 小者 ``V_E``。于是
+       ``R* = max(R0, V_E)``——取 ``E`` 个最小门槛对应的圈数分配即可
+       达到（段内门槛递增，自动满足先后顺序）；
+    5. ``V_E`` 用精确二分查找：``f(R) = Σ floor((R*t_i - a_i)/M)`` 统计
+       不超过 ``R`` 的门槛数，取使 ``f(R) >= E`` 的最小 ``R``。候选值
+       两两之差 >= ``1/max(t_i)^2``（同段间距 ``M/t_i``，跨段为整数非零
+       分子除以 ``t_i*t_j``），区间收窄到该宽度以下时 ``(lo, hi]`` 内恰
+       剩一个候选，按整除条件直接取出，全程整数/分数精确运算；
+    6. 定出 ``R*`` 后，各段可行圈数
+       ``k_i ∈ [k_min_i, k_min_i + floor((R*·t_i - a_i)/M)]``，再交由
+       ``reconcile_total`` 以账单总量收紧为最终区间；圈数唯一的段给出
+       确定用量，其余仅保留范围，不猜测。
+
+    :param diffs: 各段首尾读数差 r2 - r1
+    :param elapsed_seconds: 各段历时秒数（正整数，与 diffs 等长）
+    :param total_usage: 账单总用量（非负整数）
+    :param modulus: 计数器模数
+    """
+    if len(diffs) != len(elapsed_seconds):
+        raise ValueError("diffs 与 elapsed_seconds 数量必须一致")
+    if not diffs:
+        raise ValueError("至少需要一个读数区间")
+    if any(t <= 0 for t in elapsed_seconds):
+        raise ValueError("各段历时必须为正整数秒")
+
+    # k_min_i：使段用量非负的最小圈数（0 或 1）；a_i：对应最小非负用量
+    k_mins = [0 if d >= 0 else (-d + modulus - 1) // modulus for d in diffs]
+    base_usages = [d + k * modulus for d, k in zip(diffs, k_mins)]
+    sum_k_min = sum(k_mins)
+    feasible_min_total = sum(base_usages)
+
+    end_minus_start = sum(diffs)  # 望远镜相消：末读数 - 首读数
+    numerator = total_usage - end_minus_start
+    # 总量必须与首尾读数差模 M 同余（等价于总回绕次数为整数）
+    if numerator % modulus != 0:
+        return MinimumRateResult(
+            status=STATUS_CONFLICT,
+            conflicts=(REASON_TOTAL_INCOMPATIBLE_MODULUS,),
+            total_wraps=None,
+            min_rate=None,
+            narrowed=(),
+            feasible_min_total=feasible_min_total,
+        )
+
+    total_wraps = numerator // modulus
+    # 账单低于各段最小非负用量之和：任何速率下都不存在非负整数分配
+    if total_wraps < sum_k_min:
+        return MinimumRateResult(
+            status=STATUS_CONFLICT,
+            conflicts=(REASON_TOTAL_OUT_OF_RANGE,),
+            total_wraps=total_wraps,
+            min_rate=None,
+            narrowed=(),
+            feasible_min_total=feasible_min_total,
+        )
+
+    extra = total_wraps - sum_k_min  # 待分配的额外圈数 E >= 0
+    times = list(elapsed_seconds)
+
+    def threshold_count(rate: Fraction) -> int:
+        # 不超过 rate 的抬升门槛 v_i(m) = (a_i + m*M)/t_i（m >= 1）总数，
+        # 即 Σ max(0, floor((rate*t_i - a_i)/M))；用分子/分母做整数 floor
+        # 除法，与 Fraction 精确等价
+        p, q = rate.numerator, rate.denominator
+        total = 0
+        for a, t in zip(base_usages, times):
+            term = (p * t - a * q) // (q * modulus)
+            if term > 0:
+                total += term
+        return total
+
+    # R* 的下界之一：各段基础速率 a_i/t_i 的最大值 R0
+    base_rate = max(Fraction(a, t) for a, t in zip(base_usages, times))
+
+    if extra == 0 or threshold_count(base_rate) >= extra:
+        # 无额外圈数，或 V_E 不超过 R0（R0 处已能容纳全部 E 圈）
+        min_rate = base_rate
+    else:
+        # 二分 V_E：不变式 threshold_count(lo) < E <= threshold_count(hi)
+        lo = base_rate
+        # 段 i 自身的前 E 个门槛即覆盖 E 个，故 hi 取各段第 E 门槛的最小值
+        hi = min(
+            Fraction(a + extra * modulus, t)
+            for a, t in zip(base_usages, times)
+        )
+        max_t = max(times)
+        # 不同候选值两两之差 >= 1/max_t^2：同段间距 M/t_i >= 1/t_i；跨段
+        # 为 |(a_i+mM)t_j - (a_j+lM)t_i| / (t_i*t_j) >= 1/(t_i*t_j)
+        gap = Fraction(1, max_t * max_t)
+        while hi - lo > gap:
+            mid = (lo + hi) / 2
+            if threshold_count(mid) >= extra:
+                hi = mid
+            else:
+                lo = mid
+        # (lo, hi] 内恰剩一个候选值（数学保证），按整除条件直接取出
+        values = set()
+        for a, t in zip(base_usages, times):
+            top = math.floor(hi * t)
+            if top > lo * t and top >= a + modulus and (top - a) % modulus == 0:
+                values.add(Fraction(top, t))
+        if len(values) != 1:
+            raise RuntimeError("最小速率候选提取失败：候选不唯一或不存在")
+        min_rate = values.pop()
+
+    # 该门槛下各段可行圈数区间，再以账单总量收紧（整数区间运算，不枚举）
+    bounds = [
+        (k0, k0 + math.floor((min_rate * t - a) / modulus))
+        for k0, t, a in zip(k_mins, times, base_usages)
+    ]
+    reconciled = reconcile_total(diffs, bounds, total_usage, modulus)
+    if reconciled.status != STATUS_OK:
+        raise RuntimeError("最小速率构造失败：账单对账意外冲突")
+
+    return MinimumRateResult(
+        status=STATUS_OK,
+        conflicts=(),
+        total_wraps=total_wraps,
+        min_rate=min_rate,
+        narrowed=reconciled.narrowed,
+        feasible_min_total=feasible_min_total,
     )
