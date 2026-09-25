@@ -52,6 +52,25 @@
     同余且 B >= 0 时 K 自动非负。左侧用量 x 的可行闭区间为
     [max(0, B - C_R), min(C_L, B)]，候选读数 (首读数 + x) mod M 在模 M
     环上形成连续弧：跨零点拆段、覆盖全模数时返回全域。
+
+最小统一速率上限（solve_minimum_rate）：
+    不给定速率上限，反求「恰好能解释账单」的最小统一速率门槛 R*：
+    各段用量 u_i = diff_i + k_i*M（k_i >= 0 整数）须满足 Σ u_i = B，
+    且 u_i / s_i <= R*（s_i 为段历时秒数）。同余校验与总量对账一致；
+    K = (B - Σdiff)/M 自动非负，额外圈数 T = K - Σk_min < 0 即账单低于
+    可行最小总量 Σ base_i（total_out_of_range；速率无上限，故可行总量
+    只有下界）。速率 R 可行当且仅当
+
+        R >= max(base_i / s_i)
+        且 Σ floor((R*s_i - base_i)/M) >= T
+
+    左项计数恰为「不超过 R 的断点 (base_i + t*M)/s_i（t >= 1）」的个数，
+    故 R* = max( max_i base_i/s_i, 第 T 小的断点值 )。第 T 小断点以精确
+    二分求得：任意两个不同断点之差 >= 1/s_max²，二分（Fraction 中点、
+    整数计数）至区间宽度小于该精度后，(lo, hi] 内恰剩一个断点值，取
+    各段「严格大于 lo 的最小断点」的最小值即得。全程 Fraction/整数
+    运算，无浮点近似，也不枚举圈数组合。固定 R* 后各段可行圈数范围
+    由与总量对账相同的整数区间收紧公式给出。
 """
 
 from __future__ import annotations
@@ -678,4 +697,217 @@ def solve_missing_reading(
         left_usage_max=x_hi,
         intervals=intervals,
         candidate_count=count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 最小统一速率上限（minimum-rate）：账单总量约束下反求最小统一速率门槛
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MinimumRateSegment:
+    """最小统一速率门槛与账单总量约束后，单段仍可行的回绕次数整数区间。"""
+
+    index: int
+    diff: int
+    elapsed_seconds: int
+    base_wraps: int  # 非负增量要求的最小圈数 k_min
+    min_wraps: int
+    max_wraps: int
+
+    @property
+    def unique(self) -> bool:
+        """圈数是否已被门槛与总量唯一确定。"""
+        return self.min_wraps == self.max_wraps
+
+    @property
+    def wraps(self) -> Optional[int]:
+        return self.min_wraps if self.unique else None
+
+    def usage(self, modulus: int) -> Optional[int]:
+        """圈数唯一时该段确定用量，否则为 None。"""
+        return self.diff + self.min_wraps * modulus if self.unique else None
+
+    def usage_bounds(self, modulus: int) -> Tuple[int, int]:
+        """该区间用量的最小/最大可能值。"""
+        return (
+            self.diff + self.min_wraps * modulus,
+            self.diff + self.max_wraps * modulus,
+        )
+
+
+@dataclass(frozen=True)
+class MinimumRateResult:
+    """最小统一速率上限求解结果。"""
+
+    status: str  # STATUS_OK 或 STATUS_CONFLICT
+    conflicts: Tuple[str, ...]  # REASON_TOTAL_* 原因
+    total_wraps: Optional[int]  # 账单隐含的总回绕次数 K（不相容时为 None）
+    extra_wraps: Optional[int]  # 待分配的额外圈数 T = K - Σk_min（冲突时为 None）
+    min_rate: Optional[Fraction]  # 最小统一速率上限 R*（冲突时为 None）
+    segments: Tuple[MinimumRateSegment, ...]
+    # 可行账单总量下界 Σ base_i；速率不设上限，故可行总量无上界
+    feasible_min_total: int
+
+
+def _kth_smallest_breakpoint(
+    bases: Sequence[int],
+    elapsed_seconds: Sequence[int],
+    modulus: int,
+    kth: int,
+) -> Fraction:
+    """多重集合 ``{ (base_i + t*M)/s_i : t >= 1 }`` 中第 ``kth`` 小的值（精确）。
+
+    计数函数 ``C(R) = Σ_i max(0, floor((R*s_i - base_i)/M))`` 统计不超过
+    ``R`` 的断点个数，关于 ``R`` 单调不减；所求即满足 ``C(R) >= kth`` 的
+    最小 ``R``。对 ``R`` 做精确二分（Fraction 中点、整数计数，无浮点）：
+
+    任意两个不同断点 ``x/s_i``、``y/s_j`` 之差
+    ``|x*s_j - y*s_i| / (s_i*s_j) >= 1/s_max²``，故当二分区间宽度小于
+    ``1/s_max²`` 时，``(lo, hi]`` 内至多剩一个断点值；而计数不变式保证
+    至少有一个。取各段「严格大于 lo 的最小断点」的最小值即为所求。
+    迭代次数为 ``O(log(值域 × s_max²))``，与断点总数无关。
+    """
+    s_max = max(elapsed_seconds)
+
+    def count(rate: Fraction) -> int:
+        return sum(
+            max(0, math.floor((rate * s - b) / modulus))
+            for b, s in zip(bases, elapsed_seconds)
+        )
+
+    # 不变式：count(lo) < kth <= count(hi)
+    lo = Fraction(0)  # base_i >= 0 时 t>=1 的断点均大于 0，故 count(0) = 0
+    # hi 使每段至少容纳 kth 个断点：hi*s_i >= max(base) + kth*M
+    hi = Fraction(max(bases) + kth * modulus, min(elapsed_seconds))
+    precision = Fraction(1, s_max * s_max)
+    while hi - lo >= precision:
+        mid = (lo + hi) / 2
+        if count(mid) >= kth:
+            hi = mid
+        else:
+            lo = mid
+
+    # (lo, hi] 内恰有一个断点值：各段严格大于 lo 的最小断点（t >= 1）
+    return min(
+        Fraction(
+            b + max(1, math.floor((lo * s - b) / modulus) + 1) * modulus,
+            s,
+        )
+        for b, s in zip(bases, elapsed_seconds)
+    )
+
+
+def solve_minimum_rate(
+    diffs: Sequence[int],
+    elapsed_seconds: Sequence[int],
+    total_usage: int,
+    modulus: int,
+) -> MinimumRateResult:
+    """求最小统一速率上限 R* 及该门槛下各段可行圈数范围，不枚举圈数组合。
+
+    段 ``i`` 用量 ``u_i = diff_i + k_i*M``（``k_i >= 0`` 整数），约束为
+    ``Σ u_i = total_usage`` 且 ``u_i / s_i <= R*`` 对所有段成立，求最小
+    的 ``R*``：
+
+    1. 账单总量须与首尾读数差模 M 同余（``total_incompatible_modulus``）；
+       同余且 ``B >= 0`` 时总回绕次数 ``K = (B - Σdiff)/M`` 自动非负。
+    2. 记 ``base_i = diff_i + k_min_i*M`` 为满足非负增量的最小段用量，
+       待分配额外圈数 ``T = K - Σk_min``。``T < 0`` 即账单低于可行最小
+       总量 ``Σ base_i``（``total_out_of_range``；速率无上限，故可行
+       总量只有下界 ``[Σ base_i, +∞)``）。
+    3. 速率 ``R`` 可行当且仅当 ``R >= max(base_i/s_i)`` 且
+       ``Σ floor((R*s_i - base_i)/M) >= T``——后者即「不超过 R 的断点
+       ``(base_i + t*M)/s_i``（t >= 1）不少于 T 个」，故
+
+           R* = max( max_i base_i/s_i, 第 T 小的断点值 )
+
+       第 T 小断点由 :func:`_kth_smallest_breakpoint` 精确二分求得；
+       ``T = 0`` 时无圈可分，``R* = max base_i/s_i``，各段圈数即 ``k_min``。
+    4. 固定 ``R*`` 后各段额外圈数上限 ``cap_i = floor((R* s_i - base_i)/M)``，
+       在 ``t_i ∈ [0, cap_i]``、``Σ t_i = T`` 下由整数区间运算收紧：
+
+           lo_i = max(0, T - Σ_{j≠i} cap_j)，hi_i = min(cap_i, T)
+
+       平移回 ``k_i = k_min_i + t_i`` 即各段可行圈数范围；``lo == hi``
+       的段唯一确定用量，其余只给范围，不猜测。
+
+    :param diffs: 各段首尾读数差 r2 - r1
+    :param elapsed_seconds: 各段历时秒数（正整数）
+    :param total_usage: 账单总用量（非负整数）
+    :param modulus: 计数器模数
+    """
+    if len(diffs) != len(elapsed_seconds):
+        raise ValueError("diffs 与 elapsed_seconds 数量必须一致")
+    if not diffs:
+        raise ValueError("至少需要一段读数区间")
+
+    n = len(diffs)
+    # k_min_i：diff + k*M >= 0 的最小非负整数 k（-M < diff < M，故为 0 或 1）
+    k_mins = [0 if d >= 0 else (-d + modulus - 1) // modulus for d in diffs]
+    bases = [d + k * modulus for d, k in zip(diffs, k_mins)]
+    feasible_min_total = sum(bases)
+    end_minus_start = sum(diffs)  # 望远镜相消：末读数 - 首读数
+
+    def _conflict(reason: str, total_wraps: Optional[int]) -> MinimumRateResult:
+        return MinimumRateResult(
+            status=STATUS_CONFLICT,
+            conflicts=(reason,),
+            total_wraps=total_wraps,
+            extra_wraps=None,
+            min_rate=None,
+            segments=(),
+            feasible_min_total=feasible_min_total,
+        )
+
+    # 1) 账单总量必须与首尾读数差模 M 同余（等价于总回绕次数为整数）
+    if (total_usage - end_minus_start) % modulus != 0:
+        return _conflict(REASON_TOTAL_INCOMPATIBLE_MODULUS, None)
+
+    total_wraps = (total_usage - end_minus_start) // modulus
+    # 2) 待分配额外圈数 T；为负即账单低于可行最小总量
+    extra = total_wraps - sum(k_mins)
+    if extra < 0:
+        return _conflict(REASON_TOTAL_OUT_OF_RANGE, total_wraps)
+
+    # 3) 最小统一速率上限 R* = max( max_i base_i/s_i, 第 T 小断点 )
+    rate_base = max(Fraction(b, s) for b, s in zip(bases, elapsed_seconds))
+    if extra == 0:
+        min_rate = rate_base
+    else:
+        min_rate = max(
+            rate_base,
+            _kth_smallest_breakpoint(bases, elapsed_seconds, modulus, extra),
+        )
+
+    # 4) 门槛下各段可行圈数范围（整数区间运算，不枚举组合）
+    caps = [
+        math.floor((min_rate * s - b) / modulus)
+        for b, s in zip(bases, elapsed_seconds)
+    ]
+    sum_caps = sum(caps)
+    segments = []
+    for i in range(n):
+        lo_t = max(0, extra - (sum_caps - caps[i]))
+        hi_t = min(caps[i], extra)
+        segments.append(
+            MinimumRateSegment(
+                index=i,
+                diff=diffs[i],
+                elapsed_seconds=elapsed_seconds[i],
+                base_wraps=k_mins[i],
+                min_wraps=k_mins[i] + lo_t,
+                max_wraps=k_mins[i] + hi_t,
+            )
+        )
+
+    return MinimumRateResult(
+        status=STATUS_OK,
+        conflicts=(),
+        total_wraps=total_wraps,
+        extra_wraps=extra,
+        min_rate=min_rate,
+        segments=tuple(segments),
+        feasible_min_total=feasible_min_total,
     )

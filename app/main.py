@@ -22,13 +22,14 @@ from app.core import (
     reconcile_meter_total,
     reconcile_total,
     solve_daily_segment,
+    solve_minimum_rate,
     solve_missing_reading,
     solve_segment,
 )
 
 app = FastAPI(
     title="Water Meter Usage Verifier",
-    version="1.4.0",
+    version="1.5.0",
     description=(
         "累计水表读数用量复核：判定相邻读数间的整圈回绕次数是否唯一，"
         "唯一时给出分段与总用量；另支持账单总量对账，以账单总用量约束"
@@ -37,7 +38,10 @@ app = FastAPI(
         "并支持换表账单复核：跨旧表/新表两段（模数可不同）以账单总用量"
         "精确联立两段回绕次数，不枚举圈数组合；"
         "以及漏采读数推断：以账单总用量与漏采时刻两侧容量约束候选读数，"
-        "给出精确不重叠的候选读数闭区间，不猜测读数。"
+        "给出精确不重叠的候选读数闭区间，不猜测读数；"
+        "另支持最小统一速率上限：无需给定速率，按账单总用量反求使各段"
+        "用量/历时均不超过它的最小统一速率门槛，以约分后的分子/分母"
+        "精确返回，并给出该门槛下各段可行圈数范围与是否唯一。"
     ),
 )
 
@@ -69,19 +73,16 @@ class Reading(BaseModel):
         return _normalize_utc_second(v)
 
 
-class _BaseUsageRequest(BaseModel):
-    """读数复核 / 账单对账共用的读数与校验参数。"""
+class _BaseReadingsRequest(BaseModel):
+    """模数与读数序列的共用校验（不含速率）。"""
 
     modulus: int = Field(ge=1, description="计数器模数（回绕周期）")
-    max_rate_per_second: Decimal = Field(
-        ge=0, description="每秒最大计数增量，支持小数（按精确分数计算）"
-    )
     readings: List[Reading] = Field(
         min_length=2, description="按时间排列的读数序列，至少 2 条"
     )
 
     @model_validator(mode="after")
-    def _check_readings(self) -> "_BaseUsageRequest":
+    def _check_readings(self) -> "_BaseReadingsRequest":
         for r in self.readings:
             if r.value >= self.modulus:
                 raise ValueError(
@@ -94,6 +95,14 @@ class _BaseUsageRequest(BaseModel):
                     f"{prev.timestamp.isoformat()} 之后出现 {cur.timestamp.isoformat()}"
                 )
         return self
+
+
+class _BaseUsageRequest(_BaseReadingsRequest):
+    """读数复核 / 账单对账共用的读数与校验参数。"""
+
+    max_rate_per_second: Decimal = Field(
+        ge=0, description="每秒最大计数增量，支持小数（按精确分数计算）"
+    )
 
 
 class VerifyRequest(_BaseUsageRequest):
@@ -110,6 +119,17 @@ class ReconcileRequest(_BaseUsageRequest):
 
 class DailyRangeRequest(_BaseUsageRequest):
     """按 UTC 自然日的每日用量上下界请求（读数/模数/速率校验与其他接口一致）。"""
+
+
+class MinimumRateRequest(_BaseReadingsRequest):
+    """最小统一速率上限请求：模数、读数序列与账单总用量（无需给定速率上限）。
+
+    读数、时间戳、模数的校验与 `/v1/usage/verify` 完全一致（复用同一校验）。
+    """
+
+    total_usage: int = Field(
+        ge=0, description="账单总用量（非负整数）"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -515,6 +535,64 @@ class MissingReadingResponse(BaseModel):
     )
     conflicts: List[MissingReadingConflictOut] = Field(
         description="冲突明细：账单总量与模数不相容，或两侧容量不足"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 最小统一速率上限接口响应模型
+# ---------------------------------------------------------------------------
+
+
+class RateFractionOut(BaseModel):
+    """约分后的精确速率（分子/分母，无浮点近似）。"""
+
+    numerator: int = Field(description="约分后的分子")
+    denominator: int = Field(description="约分后的分母（正整数）")
+
+
+class MinimumRateTotalErrorOut(BaseModel):
+    kind: Literal["total"] = Field(description="冲突层级：账单总量")
+    reason: Literal[
+        "total_incompatible_modulus", "total_out_of_range"
+    ]
+    detail: str
+    feasible_min_total: int = Field(
+        description="可行账单总量的下界（含）：各段取满足非负增量的最小圈数时的总量"
+    )
+    feasible_max_total: Optional[int] = Field(
+        default=None,
+        description="可行账单总量上界；速率不设上限，故恒为 null（无上限）",
+    )
+    expected_remainder: Optional[int] = Field(
+        default=None, description="与模数相容时账单总量应有的模 M 余数"
+    )
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="账单总量隐含的总回绕次数 K；与模数不相容时为 null",
+    )
+
+
+class MinimumRateResponse(BaseModel):
+    status: Literal["ok", "conflict"]
+    modulus: int
+    total_usage: int = Field(description="请求给出的账单总用量")
+    total_wraps: Optional[int] = Field(
+        default=None,
+        description="账单总量隐含的总回绕次数 K；与模数不相容时为 null",
+    )
+    min_rate_per_second: Optional[RateFractionOut] = Field(
+        default=None,
+        description="最小统一速率上限（约分后的分子/分母）；冲突时为 null",
+    )
+    unique: bool = Field(
+        description="该门槛下各段圈数是否全部被唯一确定"
+    )
+    segments: List[SegmentRangeOut] = Field(
+        description="最小速率门槛与账单总量约束后的各段结果："
+        "圈数唯一者给出确定用量，其余给出范围；冲突时为空"
+    )
+    conflicts: List[MinimumRateTotalErrorOut] = Field(
+        description="冲突明细：账单总量与模数不相容，或低于可行最小总量"
     )
 
 
@@ -1071,4 +1149,105 @@ def infer_missing_reading(req: MissingReadingRequest) -> MissingReadingResponse:
         candidate_count=result.candidate_count,
         unique=result.unique,
         conflicts=conflicts,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 最小统一速率上限
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/usage/minimum-rate", response_model=MinimumRateResponse)
+def minimum_uniform_rate(req: MinimumRateRequest) -> MinimumRateResponse:
+    """最小统一速率上限：按账单总用量反求各段速率上限的最小统一门槛。
+
+    复用现有秒级时间戳、读数范围与模数校验（无速率上限输入）。先校验账单
+    总量与首尾读数差的模 M 同余（不相容即明确冲突）；相容时，在各段非负
+    整数用量且总和等于账单的约束下，求使「段用量 ÷ 段历时」均不超过它的
+    最小统一速率上限，以约分后的分子/分母精确返回（Fraction 精确二分 +
+    整数区间运算，不用浮点近似，也不枚举全部圈数组合），并给出该门槛下
+    每段可行圈数范围与是否唯一；范围不唯一时不虚构单段用量。
+    """
+    pairs = list(zip(req.readings, req.readings[1:]))
+    diffs = [b.value - a.value for a, b in pairs]
+    elapsed = [int((b.timestamp - a.timestamp).total_seconds()) for a, b in pairs]
+    result = solve_minimum_rate(diffs, elapsed, req.total_usage, req.modulus)
+
+    if result.status == STATUS_CONFLICT:
+        end_minus_start = sum(diffs)
+        conflicts: List[MinimumRateTotalErrorOut] = []
+        for reason in result.conflicts:
+            if reason == REASON_TOTAL_INCOMPATIBLE_MODULUS:
+                expected: Optional[int] = end_minus_start % req.modulus
+                detail = (
+                    f"账单总量与模数不相容：总量 B 必须满足 "
+                    f"B ≡ {expected} (mod {req.modulus})"
+                    f"（首尾读数差为 {end_minus_start}），收到 "
+                    f"{req.total_usage}（余数 {req.total_usage % req.modulus}），"
+                    f"总回绕次数不是整数"
+                )
+            else:  # REASON_TOTAL_OUT_OF_RANGE
+                expected = None
+                detail = (
+                    f"账单总量低于可行最小总量：各段取满足非负增量的最小圈数时，"
+                    f"总用量已为 {result.feasible_min_total}（模数 {req.modulus}），"
+                    f"收到 {req.total_usage}；速率上限不设约束时可行总量没有上界，"
+                    f"但不能低于该最小值"
+                )
+            conflicts.append(
+                MinimumRateTotalErrorOut(
+                    kind="total",
+                    reason=reason,  # type: ignore[arg-type]
+                    detail=detail,
+                    feasible_min_total=result.feasible_min_total,
+                    feasible_max_total=None,
+                    expected_remainder=expected,
+                    total_wraps=result.total_wraps,
+                )
+            )
+        return MinimumRateResponse(
+            status=STATUS_CONFLICT,
+            modulus=req.modulus,
+            total_usage=req.total_usage,
+            total_wraps=result.total_wraps,
+            min_rate_per_second=None,
+            unique=False,
+            segments=[],
+            conflicts=conflicts,
+        )
+
+    # 可行：圈数已唯一的段确定用量，其余仅给范围，不猜测
+    segments: List[SegmentRangeOut] = []
+    for (a, b), sec, ns in zip(pairs, elapsed, result.segments):
+        min_usage, max_usage = ns.usage_bounds(req.modulus)
+        segments.append(
+            SegmentRangeOut(
+                index=ns.index,
+                start_timestamp=a.timestamp,
+                end_timestamp=b.timestamp,
+                start_reading=a.value,
+                end_reading=b.value,
+                elapsed_seconds=sec,
+                min_wraps=ns.min_wraps,
+                max_wraps=ns.max_wraps,
+                wraps=ns.wraps,
+                usage=ns.usage(req.modulus),
+                min_usage=None if ns.unique else min_usage,
+                max_usage=None if ns.unique else max_usage,
+            )
+        )
+
+    rate = result.min_rate
+    assert rate is not None  # STATUS_OK 时必有最小速率
+    return MinimumRateResponse(
+        status=STATUS_OK,
+        modulus=req.modulus,
+        total_usage=req.total_usage,
+        total_wraps=result.total_wraps,
+        min_rate_per_second=RateFractionOut(
+            numerator=rate.numerator, denominator=rate.denominator
+        ),
+        unique=all(ns.unique for ns in result.segments),
+        segments=segments,
+        conflicts=[],
     )

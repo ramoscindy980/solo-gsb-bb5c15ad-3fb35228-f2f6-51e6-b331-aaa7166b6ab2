@@ -8,7 +8,12 @@ from fractions import Fraction
 
 from fastapi.testclient import TestClient
 
-from app.core import reconcile_meter_total, solve_daily_segment, solve_missing_reading
+from app.core import (
+    reconcile_meter_total,
+    solve_daily_segment,
+    solve_minimum_rate,
+    solve_missing_reading,
+)
 from app.main import app
 
 client = TestClient(app)
@@ -32,6 +37,10 @@ def _meter_change(payload):
 
 def _missing_reading(payload):
     return _post(payload, path="/v1/usage/missing-reading")
+
+
+def _minimum_rate(payload):
+    return _post(payload, path="/v1/usage/minimum-rate")
 
 
 # ---------------------------------------------------------------------------
@@ -1443,3 +1452,308 @@ def test_missing_reading_exact_by_brute_force():
         assert sorted(covered) == expected
         checked += 1
     assert checked > 500
+
+
+# ---------------------------------------------------------------------------
+# 最小统一速率上限 /v1/usage/minimum-rate
+# ---------------------------------------------------------------------------
+
+def test_minimum_rate_unique_segments():
+    """两段、账单 5000：K=5、T=4，R*=29/10，两段圈数被唯一确定为 2、3。"""
+    resp = _minimum_rate(
+        {
+            "modulus": 1000,
+            "total_usage": 5000,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+                {"timestamp": "2026-09-24T00:33:20Z", "value": 100},
+            ],
+        }
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 5
+    assert body["min_rate_per_second"] == {"numerator": 29, "denominator": 10}
+    assert body["unique"] is True
+    assert body["conflicts"] == []
+    s1, s2 = body["segments"]
+    assert (s1["wraps"], s1["usage"]) == (2, 2100)
+    assert (s2["wraps"], s2["usage"]) == (3, 2900)
+    assert s1["min_usage"] is None and s1["max_usage"] is None
+    assert s2["min_usage"] is None and s2["max_usage"] is None
+    # 各段速率 2100/1000 与 2900/1000，峰值恰为 29/10
+    assert Fraction(s1["usage"], s1["elapsed_seconds"]) == Fraction(21, 10)
+    assert Fraction(s2["usage"], s2["elapsed_seconds"]) == Fraction(29, 10)
+
+
+def test_minimum_rate_ambiguous_ranges_not_fabricated():
+    """平读数三段（1000s/500s）、账单 2000：R*=2，两段均为范围，不虚构用量。"""
+    resp = _minimum_rate(
+        {
+            "modulus": 1000,
+            "total_usage": 2000,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:16:40Z", "value": 100},
+                {"timestamp": "2026-09-24T00:25:00Z", "value": 100},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 2
+    assert body["min_rate_per_second"] == {"numerator": 2, "denominator": 1}
+    assert body["unique"] is False
+    s1, s2 = body["segments"]
+    assert (s1["min_wraps"], s1["max_wraps"]) == (1, 2)
+    assert (s1["min_usage"], s1["max_usage"]) == (1000, 2000)
+    assert s1["wraps"] is None and s1["usage"] is None
+    assert (s2["min_wraps"], s2["max_wraps"]) == (0, 1)
+    assert (s2["min_usage"], s2["max_usage"]) == (0, 1000)
+    # 可行组合 (k1,k2) ∈ {(1,1),(2,0)}，任一组合两段用量之和恒为 2000
+    assert s1["min_usage"] + s2["max_usage"] == 2000
+    assert s1["max_usage"] + s2["min_usage"] == 2000
+
+
+def test_minimum_rate_single_segment_reduced_fraction():
+    """单段：速率即 账单/历时，按约分返回（500/60 -> 25/3）。"""
+    resp = _minimum_rate(
+        {
+            "modulus": 1000,
+            "total_usage": 500,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:01:00Z", "value": 600},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["min_rate_per_second"] == {"numerator": 25, "denominator": 3}
+    assert body["unique"] is True
+    seg = body["segments"][0]
+    assert (seg["wraps"], seg["usage"]) == (0, 500)
+
+
+def test_minimum_rate_zero_extra_wraps():
+    """账单恰为最小可行总量（T=0）：R* 为各段最小用量的峰值速率，全部唯一。"""
+    resp = _minimum_rate(
+        {
+            "modulus": 1000,
+            "total_usage": 200,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 900},
+                {"timestamp": "2026-09-24T00:01:40Z", "value": 100},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["total_wraps"] == 1
+    assert body["min_rate_per_second"] == {"numerator": 2, "denominator": 1}
+    seg = body["segments"][0]
+    assert (seg["wraps"], seg["usage"]) == (1, 200)
+
+
+def test_minimum_rate_modulus_one():
+    """模数为 1：读数恒为 0，账单 5 按历时 2s/3s 分配，R*=1，各段唯一。"""
+    resp = _minimum_rate(
+        {
+            "modulus": 1,
+            "total_usage": 5,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 0},
+                {"timestamp": "2026-09-24T00:00:02Z", "value": 0},
+                {"timestamp": "2026-09-24T00:00:05Z", "value": 0},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "ok"
+    assert body["min_rate_per_second"] == {"numerator": 1, "denominator": 1}
+    assert [s["usage"] for s in body["segments"]] == [2, 3]
+    assert body["unique"] is True
+
+
+def test_minimum_rate_incompatible_modulus():
+    """账单与首尾读数差模 M 不同余：total_incompatible_modulus。"""
+    resp = _minimum_rate(
+        {
+            "modulus": 1000,
+            "total_usage": 5500,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+                {"timestamp": "2026-09-24T00:16:40Z", "value": 200},
+                {"timestamp": "2026-09-24T00:33:20Z", "value": 100},
+            ],
+        }
+    )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    assert body["min_rate_per_second"] is None
+    assert body["total_wraps"] is None
+    assert body["unique"] is False
+    conflict = body["conflicts"][0]
+    assert conflict["kind"] == "total"
+    assert conflict["reason"] == "total_incompatible_modulus"
+    assert conflict["expected_remainder"] == 0
+    assert conflict["feasible_min_total"] == 1000
+    assert conflict["feasible_max_total"] is None
+
+
+def test_minimum_rate_bill_below_feasible_minimum():
+    """账单同余但低于最小可行总量 1200：total_out_of_range，上界为 null。"""
+    resp = _minimum_rate(
+        {
+            "modulus": 1000,
+            "total_usage": 200,
+            "readings": [
+                {"timestamp": "2026-09-24T00:00:00Z", "value": 900},
+                {"timestamp": "2026-09-24T00:00:10Z", "value": 100},
+                {"timestamp": "2026-09-24T00:00:20Z", "value": 900},
+                {"timestamp": "2026-09-24T00:00:30Z", "value": 100},
+            ],
+        }
+    )
+    body = resp.json()
+    assert body["status"] == "conflict"
+    assert body["segments"] == []
+    assert body["min_rate_per_second"] is None
+    conflict = body["conflicts"][0]
+    assert conflict["reason"] == "total_out_of_range"
+    assert conflict["feasible_min_total"] == 1200
+    assert conflict["feasible_max_total"] is None
+    assert conflict["expected_remainder"] is None
+    assert body["total_wraps"] == 1  # 同余成立，K 已知
+
+
+def test_minimum_rate_reuses_reading_validation():
+    """复用现有读数校验：越界/不递增/缺时区/亚秒/读数不足/负账单等均 422。"""
+    base = {
+        "modulus": 1000,
+        "total_usage": 100,
+        "readings": [
+            {"timestamp": "2026-09-24T00:00:00Z", "value": 100},
+            {"timestamp": "2026-09-24T00:00:10Z", "value": 200},
+        ],
+    }
+
+    def expect_422(mut):
+        import copy
+
+        payload = copy.deepcopy(base)
+        mut(payload)
+        assert _minimum_rate(payload).status_code == 422
+
+    # 读数越界
+    expect_422(lambda p: p["readings"][1].update(value=1000))
+    # 时间戳不递增
+    expect_422(lambda p: p["readings"][1].update(timestamp="2026-09-24T00:00:00Z"))
+    # 缺时区
+    expect_422(lambda p: p["readings"][0].update(timestamp="2026-09-24T00:00:00"))
+    # 亚秒
+    expect_422(lambda p: p["readings"][0].update(timestamp="2026-09-24T00:00:00.5Z"))
+    # 读数不足 2 条
+    expect_422(lambda p: p.update(readings=p["readings"][:1]))
+    # 账单为负、非整数
+    expect_422(lambda p: p.update(total_usage=-1))
+    expect_422(lambda p: p.update(total_usage=12.5))
+    # 模数 < 1
+    expect_422(lambda p: p.update(modulus=0))
+
+
+# ---------------------------------------------------------------------------
+# solve_minimum_rate 精确性：与全枚举暴力结果比对（固定随机种子）
+# ---------------------------------------------------------------------------
+
+def _compositions(total, parts):
+    """把 total 拆成 parts 个非负整数之和的全部组合。"""
+    if parts == 1:
+        yield (total,)
+        return
+    for first in range(total + 1):
+        for rest in _compositions(total - first, parts - 1):
+            yield (first,) + rest
+
+
+def test_minimum_rate_exact_by_brute_force():
+    """随机小参数下，最小速率与各段圈数范围与枚举全部圈数组合一致。"""
+    rng = random.Random(20260925)
+    checked = 0
+    for _ in range(3000):
+        modulus = rng.choice([2, 3, 5, 7, 10])
+        n = rng.randint(1, 4)
+        values = [rng.randrange(modulus) for _ in range(n + 1)]
+        elapsed = [rng.randint(1, 8) for _ in range(n)]
+        diffs = [values[i + 1] - values[i] for i in range(n)]
+        k_mins = [0 if d >= 0 else 1 for d in diffs]
+        bases = [d + k * modulus for d, k in zip(diffs, k_mins)]
+        extra = rng.randint(0, 5)
+        total = sum(bases) + extra * modulus  # 同余且可行的账单
+
+        result = solve_minimum_rate(diffs, elapsed, total, modulus)
+        assert result.status == "ok"
+        assert result.total_wraps == extra + sum(k_mins)
+
+        # 暴力枚举全部圈数组合 t_i >= 0、Σt = extra，取峰值速率最小值
+        best = None
+        k_sets = [set() for _ in range(n)]
+        for ts in _compositions(extra, n):
+            peak = max(
+                Fraction(bases[i] + ts[i] * modulus, elapsed[i])
+                for i in range(n)
+            )
+            if best is None or peak < best:
+                best = peak
+                k_sets = [set() for _ in range(n)]
+            if peak == best:
+                for i in range(n):
+                    k_sets[i].add(k_mins[i] + ts[i])
+
+        assert result.min_rate == best
+        # 返回值已约分
+        assert result.min_rate.denominator > 0
+        assert math.gcd(result.min_rate.numerator, result.min_rate.denominator) == 1
+        for i, seg in enumerate(result.segments):
+            assert (seg.min_wraps, seg.max_wraps) == (min(k_sets[i]), max(k_sets[i]))
+            assert seg.unique == (len(k_sets[i]) == 1)
+            if seg.unique:
+                assert seg.usage(modulus) == diffs[i] + seg.min_wraps * modulus
+        checked += 1
+    assert checked > 500
+
+
+def test_minimum_rate_conflicts_by_brute_force():
+    """不相容与低于最小可行总量的账单均给出可区分的冲突原因。"""
+    rng = random.Random(20260925)
+    for _ in range(2000):
+        modulus = rng.choice([2, 3, 5, 7, 10])
+        n = rng.randint(1, 3)
+        values = [rng.randrange(modulus) for _ in range(n + 1)]
+        elapsed = [rng.randint(1, 8) for _ in range(n)]
+        diffs = [values[i + 1] - values[i] for i in range(n)]
+        k_mins = [0 if d >= 0 else 1 for d in diffs]
+        bases = [d + k * modulus for d, k in zip(diffs, k_mins)]
+        min_total = sum(bases)
+
+        # 破坏同余：modulus >= 2 时 +1 必不同余
+        bad = min_total + rng.randint(0, 3) * modulus + 1
+        r = solve_minimum_rate(diffs, elapsed, bad, modulus)
+        assert r.status == "conflict"
+        assert r.conflicts == ("total_incompatible_modulus",)
+        assert r.total_wraps is None
+        assert r.min_rate is None
+        assert r.feasible_min_total == min_total
+
+        # 同余但低于最小可行总量
+        if min_total - modulus >= 0:
+            low = min_total - modulus
+            r = solve_minimum_rate(diffs, elapsed, low, modulus)
+            assert r.status == "conflict"
+            assert r.conflicts == ("total_out_of_range",)
+            assert r.total_wraps == (low - sum(diffs)) // modulus
+            assert r.min_rate is None
